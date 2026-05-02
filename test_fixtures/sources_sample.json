@@ -1,0 +1,6 @@
+{
+  "sources": [
+    {"name": "DuckDuckGo", "search_url_template": "https://duckduckgo.com/?q={query}"},
+    {"name": "MyAnimeList", "search_url_template": "https://myanimelist.net/search/all?q={query}"}
+  ]
+}

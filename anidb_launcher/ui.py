@@ -16,6 +16,7 @@ from .models import AnimeDetail
 from .favorites import save_favorites, toggle_favorite
 from .launcher import launch
 from .loading_dialog import CancelledByUser, run_with_progress
+from .platform_utils import open_path
 from .preferences import load_prefs, save_prefs
 from .reminders import (
     add_reminder,
@@ -116,6 +117,10 @@ class App:
         self.current = None
         self._thumbnail_image: ImageTk.PhotoImage | None = None
         self._thumb_cache: dict[str, ImageTk.PhotoImage] = {}
+        self._thumb_load_queue: queue.Queue[str] = queue.Queue()
+        self._thumb_inflight: set[str] = set()
+        self._thumb_waiters: dict[str, list[tk.Label]] = {}
+        self._thumb_worker_count = 6
         self._source_rows: list[dict] = []
         self._check_seq = 0
         self.favorites: set[int] = favorites if favorites is not None else set()
@@ -131,16 +136,22 @@ class App:
         self._ui_queue: queue.Queue = queue.Queue()
 
         self._cards_widgets: list[tk.Widget] = []
-        self._card_thumb_refs: dict[int, "ImageTk.PhotoImage"] = {}
         self._selected_card: tk.Widget | None = None
+        self._empty_state_active = False
+        self._last_card_cols: int | None = None
+        self._last_canvas_width = 0
         # Debounce handle for typed-search rebuilds. Without this, every keystroke
         # rebuilds ~200 cards which causes visible lag on faster typing.
         self._populate_pending: str | None = None
+        self._relayout_pending: str | None = None
 
         root.title("anidb-launcher")
         root.geometry("1320x800")
+        root.minsize(1080, 680)
 
+        self._start_thumb_workers()
         self._build_layout()
+        self._bind_shortcuts()
         self._populate_list()
         self._render_source_rows()
         self._update_status()
@@ -158,21 +169,112 @@ class App:
             pass
         self.root.after(50, self._drain_ui_queue)
 
+    def _bind_shortcuts(self) -> None:
+        self.root.bind("<Control-f>", lambda _e: self._focus_search())
+        self.root.bind("/", lambda _e: self._focus_search())
+
+    def _focus_search(self) -> str | None:
+        try:
+            self.search_entry.focus_set()
+            self.search_entry.selection_range(0, tk.END)
+        except tk.TclError:
+            return None
+        return "break"
+
+    def _theme_button_text(self) -> str:
+        return "Light mode" if self.theme_name == "dark" else "Dark mode"
+
+    def _start_thumb_workers(self) -> None:
+        for _ in range(self._thumb_worker_count):
+            threading.Thread(target=self._thumb_fetch_worker_loop, daemon=True).start()
+
+    def _thumb_fetch_worker_loop(self) -> None:
+        while True:
+            url = self._thumb_load_queue.get()
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "anidb-launcher/0.1"})
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    data = resp.read()
+                img = Image.open(io.BytesIO(data))
+                img.thumbnail((self.CARD_THUMB_W, self.CARD_THUMB_H))
+                self._ui_queue.put((self._apply_card_thumb_image, (url, img)))
+            except Exception:
+                self._ui_queue.put((self._apply_card_thumb_failed, (url,)))
+            finally:
+                self._thumb_load_queue.task_done()
+
+    def _queue_card_thumbnail(self, label: tk.Label, url: str) -> None:
+        cached = self._thumb_cache.get(url)
+        if cached is not None:
+            self._apply_card_thumb_cached(label, cached)
+            return
+        waiters = self._thumb_waiters.setdefault(url, [])
+        waiters.append(label)
+        if url in self._thumb_inflight:
+            return
+        self._thumb_inflight.add(url)
+        self._thumb_load_queue.put(url)
+
+    def _on_cards_canvas_configure(self, event) -> None:
+        self.cards_canvas.itemconfig(self._cards_window_id, width=event.width)
+        if event.width == self._last_canvas_width:
+            return
+        self._last_canvas_width = event.width
+        self._schedule_card_relayout()
+
+    def _schedule_card_relayout(self) -> None:
+        if self._relayout_pending is not None:
+            try:
+                self.root.after_cancel(self._relayout_pending)
+            except (tk.TclError, ValueError):
+                pass
+        self._relayout_pending = self.root.after(120, self._relayout_cards_now)
+
+    def _relayout_cards_now(self) -> None:
+        self._relayout_pending = None
+        self._regrid_cards_only()
+
+    def _clear_search(self) -> None:
+        if self.filter_var.get():
+            self.filter_var.set("")
+        self._focus_search()
+
+    def _reset_filters(self) -> None:
+        self.filter_var.set("")
+        self.genre_var.set("All")
+        self.year_var.set("All")
+        self.format_var.set("All")
+        self.rating_var.set(0.0)
+        self.sort_var.set("Rating")
+        self.favs_only_var.set(False)
+        self.genre_combo.config(values=self._all_genres_choices)
+        self._populate_list()
+
     def _build_layout(self) -> None:
         muted = self.theme["muted"]
 
         # ── App Bar (always visible, above tabs) ──────────────────────────────
         appbar = ttk.Frame(self.root, padding=(16, 12, 16, 4))
         appbar.pack(side=tk.TOP, fill=tk.X)
-        ttk.Label(appbar, text="anidb-launcher", font=("Segoe UI", 16, "bold")).pack(side=tk.LEFT)
-        ttk.Label(appbar, text=self.mode_label, foreground=muted, padding=(10, 0, 0, 0)).pack(side=tk.LEFT, padx=(10, 0))
-        self.refresh_btn = ttk.Button(appbar, text="↻ Refresh", command=self._do_refresh)
+        brand = ttk.Frame(appbar)
+        brand.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Label(brand, text="anidb-launcher", font=("Segoe UI", 16, "bold")).pack(side=tk.LEFT)
+        ttk.Label(
+            brand,
+            text="Browse top anime and launch searches instantly",
+            foreground=muted,
+            padding=(12, 2, 0, 0),
+        ).pack(side=tk.LEFT)
+        self.mode_badge = ttk.Label(brand, text=self.mode_label, foreground=muted, padding=(12, 0, 0, 0))
+        self.mode_badge.pack(side=tk.LEFT)
+
+        self.refresh_btn = ttk.Button(appbar, text="Refresh", command=self._do_refresh)
         self.refresh_btn.pack(side=tk.RIGHT)
         if self.refresh_fn is None:
             self.refresh_btn.state(["disabled"])
         self.theme_btn = ttk.Button(
-            appbar, text=("☀" if self.theme_name == "dark" else "🌙"),
-            width=3, command=self._toggle_theme,
+            appbar, text=self._theme_button_text(),
+            width=10, command=self._toggle_theme,
         )
         self.theme_btn.pack(side=tk.RIGHT, padx=(0, 6))
 
@@ -188,10 +290,10 @@ class App:
         self.notebook.add(library_tab, text="Library")
 
         upcoming_tab = ttk.Frame(self.notebook)
-        self.notebook.add(upcoming_tab, text=" 📅 Upcoming ")
+        self.notebook.add(upcoming_tab, text="Upcoming")
 
         reminders_tab = ttk.Frame(self.notebook)
-        self.notebook.add(reminders_tab, text=" 🔔 Reminders ")
+        self.notebook.add(reminders_tab, text="Reminders")
 
         self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
@@ -210,9 +312,13 @@ class App:
         ttk.Label(searchbar, text="Search", foreground=muted).pack(side=tk.LEFT, padx=(0, 8))
         self.filter_var = tk.StringVar()
         self.filter_var.trace_add("write", lambda *_: self._debounced_populate())
-        ttk.Entry(searchbar, textvariable=self.filter_var, font=("Segoe UI", 11)).pack(
+        self.search_entry = ttk.Entry(searchbar, textvariable=self.filter_var, font=("Segoe UI", 11))
+        self.search_entry.pack(
             side=tk.LEFT, fill=tk.X, expand=True,
         )
+        ttk.Button(searchbar, text="Clear", width=7, command=self._clear_search).pack(side=tk.LEFT, padx=(8, 0))
+        self.results_hint = ttk.Label(searchbar, text="", foreground=muted, width=16, anchor=tk.E)
+        self.results_hint.pack(side=tk.RIGHT, padx=(8, 0))
 
         # ── Filter row ────────────────────────────────────────────────────────
         filters = ttk.Frame(parent, padding=(16, 6, 16, 12))
@@ -272,6 +378,7 @@ class App:
             filters, text="♥ Favorites only", variable=self.favs_only_var,
             command=self._populate_list,
         ).pack(side=tk.LEFT)
+        ttk.Button(filters, text="Reset filters", command=self._reset_filters).pack(side=tk.RIGHT)
 
         ttk.Separator(parent, orient=tk.HORIZONTAL).pack(side=tk.TOP, fill=tk.X)
 
@@ -300,10 +407,7 @@ class App:
             "<Configure>",
             lambda _e: self.cards_canvas.config(scrollregion=self.cards_canvas.bbox("all")),
         )
-        self.cards_canvas.bind(
-            "<Configure>",
-            lambda e: self.cards_canvas.itemconfig(self._cards_window_id, width=e.width),
-        )
+        self.cards_canvas.bind("<Configure>", self._on_cards_canvas_configure)
         self.cards_canvas.bind("<Enter>", self._bind_mousewheel)
         self.cards_canvas.bind("<Leave>", self._unbind_mousewheel)
 
@@ -447,17 +551,8 @@ class App:
             "<Configure>",
             lambda e: self.upcoming_canvas.itemconfig(self._upcoming_window_id, width=e.width),
         )
-        self.upcoming_canvas.bind(
-            "<Enter>",
-            lambda _e: self.upcoming_canvas.bind_all(
-                "<MouseWheel>",
-                lambda ev: self.upcoming_canvas.yview_scroll(int(-ev.delta / 120), "units"),
-            ),
-        )
-        self.upcoming_canvas.bind(
-            "<Leave>",
-            lambda _e: self.upcoming_canvas.unbind_all("<MouseWheel>"),
-        )
+        self.upcoming_canvas.bind("<Enter>", self._bind_upcoming_mousewheel)
+        self.upcoming_canvas.bind("<Leave>", self._unbind_upcoming_mousewheel)
 
     def _populate_upcoming(self) -> None:
         for w in self.upcoming_inner.winfo_children():
@@ -561,6 +656,8 @@ class App:
             "<Configure>",
             lambda e: self.reminders_canvas.itemconfig(self._reminders_window_id, width=e.width),
         )
+        self.reminders_canvas.bind("<Enter>", self._bind_reminders_mousewheel)
+        self.reminders_canvas.bind("<Leave>", self._unbind_reminders_mousewheel)
 
     def _populate_reminders(self) -> None:
         for w in self.reminders_inner.winfo_children():
@@ -661,15 +758,76 @@ class App:
                 pass
         self._populate_reminders()
 
+    def _bind_global_mousewheel(self, handler) -> None:
+        self.root.bind_all("<MouseWheel>", handler)
+        # X11/Linux wheel events.
+        self.root.bind_all("<Button-4>", handler)
+        self.root.bind_all("<Button-5>", handler)
+
+    def _unbind_global_mousewheel(self) -> None:
+        self.root.unbind_all("<MouseWheel>")
+        self.root.unbind_all("<Button-4>")
+        self.root.unbind_all("<Button-5>")
+
+    def _wheel_units(self, event) -> int:
+        num = getattr(event, "num", None)
+        if num == 4:
+            return -1
+        if num == 5:
+            return 1
+        delta = int(getattr(event, "delta", 0))
+        if delta == 0:
+            return 0
+        if sys.platform == "darwin":
+            # macOS uses smaller dynamic deltas; keep the motion smooth.
+            return -1 if delta > 0 else 1
+        steps = int(-delta / 120)
+        if steps == 0:
+            return -1 if delta > 0 else 1
+        return steps
+
     def _bind_detail_mousewheel(self, _event=None) -> None:
-        self.detail_canvas.bind_all("<MouseWheel>", self._on_detail_mousewheel)
+        self._bind_global_mousewheel(self._on_detail_mousewheel)
 
     def _unbind_detail_mousewheel(self, _event=None) -> None:
-        self.detail_canvas.unbind_all("<MouseWheel>")
+        self._unbind_global_mousewheel()
 
     def _on_detail_mousewheel(self, event) -> None:
+        units = self._wheel_units(event)
+        if units == 0:
+            return
         try:
-            self.detail_canvas.yview_scroll(int(-event.delta / 120), "units")
+            self.detail_canvas.yview_scroll(units, "units")
+        except tk.TclError:
+            pass
+
+    def _bind_upcoming_mousewheel(self, _event=None) -> None:
+        self._bind_global_mousewheel(self._on_upcoming_mousewheel)
+
+    def _unbind_upcoming_mousewheel(self, _event=None) -> None:
+        self._unbind_global_mousewheel()
+
+    def _on_upcoming_mousewheel(self, event) -> None:
+        units = self._wheel_units(event)
+        if units == 0:
+            return
+        try:
+            self.upcoming_canvas.yview_scroll(units, "units")
+        except tk.TclError:
+            pass
+
+    def _bind_reminders_mousewheel(self, _event=None) -> None:
+        self._bind_global_mousewheel(self._on_reminders_mousewheel)
+
+    def _unbind_reminders_mousewheel(self, _event=None) -> None:
+        self._unbind_global_mousewheel()
+
+    def _on_reminders_mousewheel(self, event) -> None:
+        units = self._wheel_units(event)
+        if units == 0:
+            return
+        try:
+            self.reminders_canvas.yview_scroll(units, "units")
         except tk.TclError:
             pass
 
@@ -787,7 +945,8 @@ class App:
 
     CARD_THUMB_W = 200
     CARD_THUMB_H = 285
-    CARD_COLS = 3
+    CARD_MIN_COLS = 2
+    CARD_MAX_COLS = 5
     CARD_CAP = 200
 
     _THEMES = {
@@ -795,6 +954,8 @@ class App:
             "card_hover_bg": "#2c2c30",
             "card_selected_bg": "#3a4a6c",
             "card_selected_border": "#7fb4ff",
+            "card_border": "#2b2b31",
+            "card_hover_border": "#444454",
             "card_title_fg": "#fafafa",
             "card_meta_fg": "#9aa0a6",
             "card_subtle_fg": "#7a7a82",
@@ -818,6 +979,8 @@ class App:
             "card_hover_bg": "#e8e8ec",
             "card_selected_bg": "#cfdcf7",
             "card_selected_border": "#1f6fff",
+            "card_border": "#d2d7e0",
+            "card_hover_border": "#bcc7da",
             "card_title_fg": "#1a1a1a",
             "card_meta_fg": "#5a5a62",
             "card_subtle_fg": "#7a7a82",
@@ -852,20 +1015,51 @@ class App:
         return self.theme["card_selected_bg"]
 
     def _bind_mousewheel(self, _event=None) -> None:
-        self.cards_canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+        self._bind_global_mousewheel(self._on_mousewheel)
 
     def _unbind_mousewheel(self, _event=None) -> None:
-        self.cards_canvas.unbind_all("<MouseWheel>")
+        self._unbind_global_mousewheel()
 
     def _on_mousewheel(self, event) -> None:
+        units = self._wheel_units(event)
+        if units == 0:
+            return
         try:
-            self.cards_canvas.yview_scroll(int(-event.delta / 120), "units")
+            self.cards_canvas.yview_scroll(units, "units")
         except tk.TclError:
             pass
 
-    def _populate_list(self) -> None:
+    def _card_columns(self) -> int:
+        width = max(self.cards_canvas.winfo_width(), 1)
+        target_card_w = self.CARD_THUMB_W + 52
+        cols = width // target_card_w
+        return max(self.CARD_MIN_COLS, min(self.CARD_MAX_COLS, cols))
+
+    def _regrid_cards_only(self) -> None:
+        if not self._cards_widgets:
+            return
+        cols = self._card_columns()
+        if cols == self._last_card_cols:
+            return
+        self._last_card_cols = cols
+        for col in range(self.CARD_MAX_COLS):
+            self.cards_inner.columnconfigure(col, weight=0, uniform="")
+        for col in range(cols):
+            self.cards_inner.columnconfigure(col, weight=1, uniform="cards")
+
+        if self._empty_state_active:
+            self._cards_widgets[0].grid_configure(row=0, column=0, columnspan=cols, sticky="w")
+            return
+
+        for i, card in enumerate(self._cards_widgets):
+            r, c = divmod(i, cols)
+            card.grid_configure(row=r, column=c, padx=6, pady=6, sticky="nsew")
+
+    def _populate_list(self, reset_scroll: bool = True) -> None:
         self.rating_value_label.config(text=f"{self.rating_var.get():.1f}")
         self._filtered = self._filtered_items()
+        n_shown = len(self._filtered)
+        self.results_hint.config(text=f"{n_shown} shown")
 
         for w in self._cards_widgets:
             try:
@@ -874,17 +1068,34 @@ class App:
                 pass
         self._cards_widgets = []
         self._selected_card = None
+        self._empty_state_active = False
 
-        for col in range(self.CARD_COLS):
+        cols = self._card_columns()
+        self._last_card_cols = cols
+        for col in range(self.CARD_MAX_COLS):
+            self.cards_inner.columnconfigure(col, weight=0, uniform="")
+        for col in range(cols):
             self.cards_inner.columnconfigure(col, weight=1, uniform="cards")
 
-        for i, item in enumerate(self._filtered[: self.CARD_CAP]):
-            card = self._build_card(item)
-            r, c = divmod(i, self.CARD_COLS)
-            card.grid(row=r, column=c, padx=6, pady=6, sticky="nsew")
-            self._cards_widgets.append(card)
+        if not self._filtered:
+            empty = ttk.Label(
+                self.cards_inner,
+                text="No anime match these filters. Try Reset filters or a broader search.",
+                foreground=self.theme["muted"],
+                padding=(8, 24),
+            )
+            empty.grid(row=0, column=0, columnspan=cols, sticky="w")
+            self._cards_widgets.append(empty)
+            self._empty_state_active = True
+        else:
+            for i, item in enumerate(self._filtered[: self.CARD_CAP]):
+                card = self._build_card(item)
+                r, c = divmod(i, cols)
+                card.grid(row=r, column=c, padx=6, pady=6, sticky="nsew")
+                self._cards_widgets.append(card)
 
-        self.cards_canvas.yview_moveto(0)
+        if reset_scroll:
+            self.cards_canvas.yview_moveto(0)
         self._update_status()
 
     def _build_card(self, item) -> tk.Frame:
@@ -894,8 +1105,8 @@ class App:
         t = self.theme
         card = tk.Frame(
             self.cards_inner,
-            background=canvas_bg, padx=8, pady=8,
-            highlightthickness=2, highlightbackground=canvas_bg,
+            background=canvas_bg, padx=10, pady=10,
+            highlightthickness=1, highlightbackground=t["card_border"],
             cursor="hand2",
         )
         card._aid = item.aid  # type: ignore[attr-defined]
@@ -911,7 +1122,7 @@ class App:
 
         title_lbl = tk.Label(
             card, text=item.title, font=("Segoe UI", 10, "bold"),
-            wraplength=self.CARD_THUMB_W, justify=tk.CENTER, anchor=tk.CENTER,
+            wraplength=self.CARD_THUMB_W - 10, justify=tk.CENTER, anchor=tk.CENTER,
             background=canvas_bg, foreground=t["card_title_fg"],
         )
         title_lbl.pack(fill=tk.X)
@@ -947,7 +1158,10 @@ class App:
         def on_enter(_event=None, c=card):
             if c is not self._selected_card:
                 try:
-                    c.config(background=self.CARD_HOVER_BG, highlightbackground=self.CARD_HOVER_BG)
+                    c.config(
+                        background=self.CARD_HOVER_BG,
+                        highlightbackground=t["card_hover_border"],
+                    )
                     for child in _all_descendants(c):
                         if isinstance(child, (tk.Frame, tk.Label)):
                             child.config(background=self.CARD_HOVER_BG)
@@ -956,7 +1170,7 @@ class App:
         def on_leave(_event=None, c=card):
             if c is not self._selected_card:
                 try:
-                    c.config(background=c._base_bg, highlightbackground=c._base_bg)
+                    c.config(background=c._base_bg, highlightbackground=t["card_border"])
                     for child in _all_descendants(c):
                         if isinstance(child, (tk.Frame, tk.Label)):
                             child.config(background=c._base_bg)
@@ -967,11 +1181,7 @@ class App:
         card.bind("<Leave>", on_leave)
 
         if item.detail and item.detail.picture_url:
-            threading.Thread(
-                target=self._fetch_card_thumb_worker,
-                args=(thumb, item.detail.picture_url),
-                daemon=True,
-            ).start()
+            self._queue_card_thumbnail(thumb, item.detail.picture_url)
 
         return card
 
@@ -981,7 +1191,7 @@ class App:
         if prev is not None and prev.winfo_exists():
             try:
                 base = getattr(prev, "_base_bg", "#1c1c1c")
-                prev.config(background=base, highlightbackground=base)
+                prev.config(background=base, highlightbackground=self.theme["card_border"])
                 for child in _all_descendants(prev):
                     if isinstance(child, (tk.Frame, tk.Label)):
                         child.config(background=base)
@@ -1020,21 +1230,6 @@ class App:
             if self.fetch_detail is not None:
                 self._fetch_detail_async(item)
 
-    def _fetch_card_thumb_worker(self, label: tk.Label, url: str) -> None:
-        try:
-            cached = self._thumb_cache.get(url)
-            if cached is not None:
-                self._ui_queue.put((self._apply_card_thumb_cached, (label, cached)))
-                return
-            req = urllib.request.Request(url, headers={"User-Agent": "anidb-launcher/0.1"})
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                data = resp.read()
-            img = Image.open(io.BytesIO(data))
-            img.thumbnail((self.CARD_THUMB_W, self.CARD_THUMB_H))
-            self._ui_queue.put((self._apply_card_thumb_image, (label, img, url)))
-        except Exception:
-            pass
-
     def _apply_card_thumb_cached(self, label: tk.Label, photo: "ImageTk.PhotoImage") -> None:
         if not label.winfo_exists():
             return
@@ -1043,15 +1238,19 @@ class App:
         # so the label sizes to the image's natural pixels.
         # Don't pass background="" — Tk rejects empty as "unknown color name".
         label.config(image=photo, text="", width=0, height=0)
-        self._card_thumb_refs[id(label)] = photo
+        label.image = photo  # type: ignore[attr-defined]
 
-    def _apply_card_thumb_image(self, label: tk.Label, img: "Image.Image", url: str) -> None:
-        if not label.winfo_exists():
-            return
+    def _apply_card_thumb_failed(self, url: str) -> None:
+        self._thumb_inflight.discard(url)
+        self._thumb_waiters.pop(url, None)
+
+    def _apply_card_thumb_image(self, url: str, img: "Image.Image") -> None:
         photo = ImageTk.PhotoImage(img)
         self._thumb_cache[url] = photo
-        label.config(image=photo, text="", width=0, height=0)
-        self._card_thumb_refs[id(label)] = photo
+        waiters = self._thumb_waiters.pop(url, [])
+        self._thumb_inflight.discard(url)
+        for label in waiters:
+            self._apply_card_thumb_cached(label, photo)
 
     def _fetch_detail_async(self, item) -> None:
         aid = item.aid
@@ -1179,6 +1378,7 @@ class App:
         self._after_refresh_dialog_closed()
         self.all_items = new_items
         self.mode_label = f"live · {source_name}"
+        self.mode_badge.config(text=self.mode_label)
         # Repopulate filter dropdowns from the new data.
         self.format_combo.config(values=["All"] + self._available_formats())
         self._all_genres_choices = ["All"] + self._available_genres()
@@ -1237,8 +1437,7 @@ class App:
         if self.current and self.current.detail:
             self._show_detail(self.current.detail)
 
-        # Update the toggle button icon to reflect the *next* state.
-        self.theme_btn.config(text=("☀" if new == "dark" else "🌙"))
+        self.theme_btn.config(text=self._theme_button_text())
 
     def _toggle_favorite(self) -> None:
         if self.current is None:
@@ -1445,8 +1644,7 @@ class App:
             self.sources_path.write_text('{"sources": []}\n', encoding="utf-8")
             self._reload_sources()
         try:
-            import os
-            os.startfile(str(self.sources_path))  # Windows
+            open_path(self.sources_path)
         except Exception as e:
             messagebox.showerror("Open failed", f"Could not open {self.sources_path}: {e}")
 
@@ -1462,11 +1660,28 @@ class App:
         self._render_source_rows()
         self._update_status()
 
+    def _active_filter_summary(self) -> str:
+        bits: list[str] = []
+        if self.filter_var.get().strip():
+            bits.append("search")
+        if self.genre_var.get() != "All":
+            bits.append(f"genre:{self.genre_var.get()}")
+        if self.year_var.get() != "All":
+            bits.append(f"year:{self.year_var.get()}")
+        if self.format_var.get() != "All":
+            bits.append(f"format:{self.format_var.get()}")
+        if self.rating_var.get() > 0.0:
+            bits.append(f"min:{self.rating_var.get():.1f}")
+        if self.favs_only_var.get():
+            bits.append("favorites")
+        return ", ".join(bits) if bits else "no filters"
+
     def _update_status(self) -> None:
         n_shown = len(getattr(self, "_filtered", self.all_items))
         n_total = len(self.all_items)
+        filters = self._active_filter_summary()
         self.status.config(
-            text=f"{n_shown}/{n_total} anime · {len(self.sources)} source(s) · {self.sources_path}"
+            text=f"{n_shown}/{n_total} anime | {len(self.sources)} source(s) | {filters}"
         )
 
 

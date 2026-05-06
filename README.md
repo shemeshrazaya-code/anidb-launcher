@@ -33,7 +33,17 @@ python -m anidb_launcher
 ```
 
 On first launch you'll see the setup dialog (see below). After that the app
-remembers your sources in `~/.config/anidb-launcher/sources.json`.
+stores local state in an OS-specific config directory:
+
+- macOS: `~/Library/Application Support/anidb-launcher/`
+- Windows: `%APPDATA%\anidb-launcher\`
+- Linux: `~/.config/anidb-launcher/` (or `$XDG_CONFIG_HOME/anidb-launcher/`)
+
+Override on any OS with:
+
+```
+ANIDB_LAUNCHER_CONFIG_DIR=/path/to/dir
+```
 
 ## Adding sources
 
@@ -68,7 +78,7 @@ hit **Add source...** with the same recipe.
 You can also edit the file directly:
 
 ```
-~/.config/anidb-launcher/sources.json
+<config-dir>/sources.json
 ```
 
 ```json
@@ -133,6 +143,45 @@ Both are public read-only APIs. No login required.
 pip install -r requirements.txt
 pytest
 ```
+
+## Workflow
+
+This repo now includes a gstack-style delivery loop in `WORKFLOW.md`:
+
+- Think -> Plan -> Build -> Review -> Test -> Ship -> Reflect
+- Suggested gstack commands: `/office-hours`, `/plan-eng-review`, `/review`, `/qa`, `/ship`, `/retro`
+
+Design references for UI work:
+
+- `DESIGN.md` (project visual and UX system)
+- `docs/UI_REVIEW_CHECKLIST.md` (release UI audit checklist)
+
+Pre-ship gates for every branch:
+
+```
+python scripts/ship_check.py
+```
+
+For release candidates (includes packaging build):
+
+```
+python scripts/ship_check.py --include-build
+```
+
+## Packaging
+
+Build with PyInstaller:
+
+```
+python -m pip install pyinstaller
+python build.py
+```
+
+Artifacts by platform:
+
+- Windows: `dist/anidb-launcher.exe`
+- macOS: `dist/anidb-launcher.app`
+- Linux: `dist/anidb-launcher`
 
 Modules:
 

@@ -14,13 +14,14 @@ from .demo_data import DEMO_ANIME
 from .favorites import load_favorites
 from .jikan_client import JikanClient
 from .loading_dialog import run_with_progress
+from .platform_utils import app_config_dir
 from .preferences import load_prefs
 from .reminders import load_reminders
 from .setup_dialog import run_setup_if_needed
 from .sources import load_sources, save_bundled_defaults
 from .ui import apply_modern_theme, run_app
 
-DEFAULT_CONFIG_DIR = Path.home() / ".config" / "anidb-launcher"
+DEFAULT_CONFIG_DIR = app_config_dir()
 DEFAULT_SOURCES_PATH = DEFAULT_CONFIG_DIR / "sources.json"
 DEFAULT_FAVORITES_PATH = DEFAULT_CONFIG_DIR / "favorites.json"
 DEFAULT_PREFS_PATH = DEFAULT_CONFIG_DIR / "prefs.json"

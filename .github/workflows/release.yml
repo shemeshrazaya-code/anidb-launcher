@@ -1,0 +1,74 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to build and attach artifacts to (e.g. v0.1.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: dist/anidb-launcher-windows-x64.exe
+            package_cmd: mv dist/anidb-launcher.exe dist/anidb-launcher-windows-x64.exe
+          - os: macos-latest
+            artifact: dist/anidb-launcher-macos-arm64.zip
+            package_cmd: cd dist && zip -r anidb-launcher-macos-arm64.zip anidb-launcher.app
+          - os: ubuntu-latest
+            artifact: dist/anidb-launcher-linux-x64.tar.gz
+            package_cmd: tar czf dist/anidb-launcher-linux-x64.tar.gz -C dist anidb-launcher
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install Tk (Linux only)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install pyinstaller
+
+      - name: Run tests
+        run: python -m pytest tests/ -v
+
+      - name: Build artifact
+        run: python build.py
+
+      - name: Package artifact
+        shell: bash
+        run: ${{ matrix.package_cmd }}
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: ${{ matrix.artifact }}
+          fail_on_unmatched_files: true
